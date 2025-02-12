@@ -79,18 +79,26 @@ def get_cars_in_quadrilaterals(detections: Detections) -> list:
     print("Cars in quadrilaterals:", cars)
     return cars
 
-def update_car_time_in_quadrilaterals(car_label: str, xyxy: tuple):
-    try:
-        if car_label not in CARS_TIME_IN_QUADRILATERALS:
-            CARS_TIME_IN_QUADRILATERALS[car_label] = {}
-            for i, quad in enumerate(quadrilaterals):
-                CARS_TIME_IN_QUADRILATERALS[car_label][i] = 0
-        for i, quad in enumerate(quadrilaterals):
-            if cv2.pointPolygonTest(np.array(quad, dtype=np.int32), (xyxy[0], xyxy[1]), False) >= 0:
-                CARS_TIME_IN_QUADRILATERALS[car_label][i] += 1 / FPS
+def get_car_label(detection: Detections) -> str:
+    class_name = detection[-1]["class_name"][0]
+    tracker_id = detection.tracker_id[0]
+    return format_label(class_name, tracker_id)
 
+def update_car_time_in_quadrilaterals(cars_in_quadrilaterals: list[Detections]):
+    global CARS_TIME_IN_QUADRILATERALS
+    try:
+        for detection in cars_in_quadrilaterals:
+            car_label = get_car_label(detection)
+            if car_label not in CARS_TIME_IN_QUADRILATERALS:
+                CARS_TIME_IN_QUADRILATERALS[car_label] = 0
+            CARS_TIME_IN_QUADRILATERALS[car_label] += 1 / FPS
+        car_labels = [get_car_label(detection) for detection in cars_in_quadrilaterals]
+        for car_label in CARS_TIME_IN_QUADRILATERALS:
+            if car_label not in car_labels:
+                CARS_TIME_IN_QUADRILATERALS[car_label] = 0
+        # delete any cars with time 0
+        CARS_TIME_IN_QUADRILATERALS = {car_label: time for car_label, time in CARS_TIME_IN_QUADRILATERALS.items() if time > 0}
     except Exception as e:
-        print(xyxy)
         raise e
 
 def remove_detection(detections: Detections, index: int) -> Detections:
@@ -106,11 +114,14 @@ def remove_detection(detections: Detections, index: int) -> Detections:
 
 def draw_car_detections(frame: np.ndarray, detections: Detections):
     cars_in_quadrilaterals = get_cars_in_quadrilaterals(detections)
+    update_car_time_in_quadrilaterals(cars_in_quadrilaterals)
+
     # kept_detections_ids = []
     # kept_detections = detections
 
-    car_in_quad_color = ANN_COLORS.YELLOW.value
+    car_in_quad_color = ANN_COLORS.RED.value
     normal_car_color = ANN_COLORS.WHITE.value
+    car_stopped_color = ANN_COLORS.GREEN.value
     
     annotations: list[object_annotation] = []
 
@@ -123,11 +134,12 @@ def draw_car_detections(frame: np.ndarray, detections: Detections):
         label = format_label(class_name, tracker_id)
         xyxy = detection[0].xyxy[0]
         # print(f"Car {label} detected at {xyxy}")
-        # update_car_time_in_quadrilaterals(label, xyxy)
         color = normal_car_color
         try:
             if detection in cars_in_quadrilaterals:
                 color = car_in_quad_color
+            if label in CARS_TIME_IN_QUADRILATERALS and CARS_TIME_IN_QUADRILATERALS[label] >= TIME_IN_QUADRILATERAL_FOR_STOP:
+                color = car_stopped_color
         except Exception as e:
             print(e)
             print(detection)
