@@ -1,5 +1,6 @@
 import dataclasses
 import enum
+from pprint import pprint
 from typing import Optional
 import cv2
 import json
@@ -21,6 +22,7 @@ FPS = None
 
 # map car id to a dict containg a key for each quadrilateral and the time spent in that quadrilateral
 CARS_TIME_IN_QUADRILATERALS = {}
+CARS_IN_QUADRILATERALS = {}  # map label to detection
 
 # Load YOLO model
 model = YOLO("yolov8n.pt")
@@ -66,40 +68,23 @@ def get_car_detections(frame: np.ndarray) -> Detections:
     detections: Detections = tracker.update_with_detections(detections)
     return detections
 
-def get_cars_in_quadrilaterals(detections: Detections) -> list:
-    cars = []
-    for i in range(len(detections)):
-        detection = detections[i]
-        x1, y1, x2, y2 = map(int, detection[0].xyxy[0])
-        car_center = ((x1 + x2) // 2, (y1 + y2) // 2)
-        for quad in quadrilaterals:
-            if cv2.pointPolygonTest(np.array(quad, dtype=np.int32), car_center, False) >= 0:
-                cars.append(detection)
-                break
-    print("Cars in quadrilaterals:", cars)
-    return cars
+# def get_cars_in_quadrilaterals(detections: Detections) -> list:
+#     cars = []
+#     for i in range(len(detections)):
+#         detection = detections[i]
+#         x1, y1, x2, y2 = map(int, detection[0].xyxy[0])
+#         car_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+#         for quad in quadrilaterals:
+#             if cv2.pointPolygonTest(np.array(quad, dtype=np.int32), car_center, False) >= 0:
+#                 cars.append(detection)
+#                 break
+#     print("Cars in quadrilaterals:", cars)
+#     return cars
 
 def get_car_label(detection: Detections) -> str:
     class_name = detection[-1]["class_name"][0]
     tracker_id = detection.tracker_id[0]
     return format_label(class_name, tracker_id)
-
-def update_car_time_in_quadrilaterals(cars_in_quadrilaterals: list[Detections]):
-    global CARS_TIME_IN_QUADRILATERALS
-    try:
-        for detection in cars_in_quadrilaterals:
-            car_label = get_car_label(detection)
-            if car_label not in CARS_TIME_IN_QUADRILATERALS:
-                CARS_TIME_IN_QUADRILATERALS[car_label] = 0
-            CARS_TIME_IN_QUADRILATERALS[car_label] += 1 / FPS
-        car_labels = [get_car_label(detection) for detection in cars_in_quadrilaterals]
-        for car_label in CARS_TIME_IN_QUADRILATERALS:
-            if car_label not in car_labels:
-                CARS_TIME_IN_QUADRILATERALS[car_label] = 0
-        # delete any cars with time 0
-        CARS_TIME_IN_QUADRILATERALS = {car_label: time for car_label, time in CARS_TIME_IN_QUADRILATERALS.items() if time > 0}
-    except Exception as e:
-        raise e
 
 def remove_detection(detections: Detections, index: int) -> Detections:
     return Detections(
@@ -112,65 +97,6 @@ def remove_detection(detections: Detections, index: int) -> Detections:
         metadata={key: value for key, value in detections.metadata.items()}
     )
 
-def draw_car_detections(frame: np.ndarray, detections: Detections):
-    cars_in_quadrilaterals = get_cars_in_quadrilaterals(detections)
-    update_car_time_in_quadrilaterals(cars_in_quadrilaterals)
-
-    # kept_detections_ids = []
-    # kept_detections = detections
-
-    car_in_quad_color = ANN_COLORS.RED.value
-    normal_car_color = ANN_COLORS.WHITE.value
-    car_stopped_color = ANN_COLORS.GREEN.value
-    
-    annotations: list[object_annotation] = []
-
-    for i in range(len(detections)):
-        detection = detections[i]
-        class_name = detection[-1]["class_name"][0]
-        if class_name not in ["car", "truck"]:
-            continue
-        tracker_id = detections.tracker_id[i]
-        label = format_label(class_name, tracker_id)
-        xyxy = detection[0].xyxy[0]
-        # print(f"Car {label} detected at {xyxy}")
-        color = normal_car_color
-        try:
-            if detection in cars_in_quadrilaterals:
-                color = car_in_quad_color
-            if label in CARS_TIME_IN_QUADRILATERALS and CARS_TIME_IN_QUADRILATERALS[label] >= TIME_IN_QUADRILATERAL_FOR_STOP:
-                color = car_stopped_color
-        except Exception as e:
-            print(e)
-            print(detection)
-            print(cars_in_quadrilaterals)
-            raise e
-        annotations.append(object_annotation(label=label, xyxy=xyxy, color=color))
-
-    annotated_frame = frame.copy()
-
-    # annotated_frame = box_annotator.annotate(
-    #     scene=annotated_frame, detections=detections)
-    # annotated_frame = label_annotator.annotate(
-    #     scene=annotated_frame, detections=detections, labels=labels)
-    # halo_annotator = sv.HaloAnnotator(opacity=1)
-    # annotated_frame = halo_annotator.annotate(
-    #     scene=annotated_frame,
-    #     detections=detections,
-    # )
-
-    object_annotation.draw_annotations(annotated_frame, annotations)
-
-    return annotated_frame
-
-# time in seconds a car must be in a quadrilateral to be considered stopped
-TIME_IN_QUADRILATERAL_FOR_STOP = 2
-
-def log_cars_stopped_in_quadrilaterals():
-    for car_label, quadrilateral_times in CARS_TIME_IN_QUADRILATERALS.items():
-        for i, time in quadrilateral_times.items():
-            if time >= TIME_IN_QUADRILATERAL_FOR_STOP:
-                print(f"Car {car_label} stopped in quadrilateral {i} for {time:.2f} seconds.")
 
 @enum.unique
 class ANN_COLORS(enum.Enum):
@@ -183,10 +109,42 @@ class ANN_COLORS(enum.Enum):
     WHITE = (255, 255, 255)
     BLACK = (0, 0, 0)
 
+
 @dataclasses.dataclass
-class object_annotation:
+class CarDetection:
     xyxy: tuple
-    color: tuple
+    class_name: str
+    tracker_id: int
+
+    @classmethod
+    def from_detections(cls, detection: Detections, index: int):
+        class_name = detection[index]["class_name"][0]
+        if class_name not in ("car", "truck"):
+            # print(f"Skipping detection of class {class_name}.")
+            return None
+        return cls(
+            xyxy=detection.xyxy[index],
+            class_name=class_name,
+            tracker_id=detection.tracker_id[index],
+        )
+    
+    @property
+    def label(self):
+        return format_label(self.class_name, self.tracker_id)
+    
+    @property
+    def is_in_quadrilateral(self):
+        x1, y1, x2, y2 = map(int, self.xyxy)
+        car_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+        for quad in quadrilaterals:
+            if cv2.pointPolygonTest(np.array(quad, dtype=np.int32), car_center, False) >= 0:
+                return True
+        return False
+    
+@dataclasses.dataclass
+class CarAnnotation:
+    xyxy: tuple
+    color: tuple = ANN_COLORS.WHITE.value
     label: Optional[str] = None
 
     # function that takes in a frame and draws the object annotation on the frame
@@ -208,17 +166,86 @@ class object_annotation:
     def draw_annotations(
         cls,
         frame,
-        annotations: list["object_annotation"]
+        annotations: list["CarAnnotation"]
     ):
         for annotation in annotations:
             annotation.draw(frame)
-    
+
+    @classmethod
+    def from_car_detection(cls, detection: CarDetection):
+        return cls(
+            xyxy=detection.xyxy,
+            color=get_car_annotation_color(detection),
+            label=detection.label
+        )
+
+def update_car_time_in_quadrilaterals(car_detections: list[CarDetection]):
+    global CARS_TIME_IN_QUADRILATERALS
+    try:
+        for car_detection in car_detections:
+            if not car_detection.is_in_quadrilateral:
+                continue
+            car_label = car_detection.label
+            if car_label not in CARS_TIME_IN_QUADRILATERALS:
+                CARS_TIME_IN_QUADRILATERALS[car_label] = 0
+            CARS_TIME_IN_QUADRILATERALS[car_label] += 1 / FPS
+        car_labels = [detection.label for detection in car_detections]
+        for car_label in list(CARS_TIME_IN_QUADRILATERALS.keys()):
+            if car_label not in car_labels:
+                CARS_TIME_IN_QUADRILATERALS[car_label] = 0
+        # delete any cars with time 0
+        CARS_TIME_IN_QUADRILATERALS = {car_label: time for car_label, time in CARS_TIME_IN_QUADRILATERALS.items() if time > 0}
+    except Exception as e:
+        raise e
+    pprint(CARS_TIME_IN_QUADRILATERALS)
+
+def get_car_annotation_color(cd: CarDetection) -> tuple:
+    if cd.is_in_quadrilateral:
+        if (
+            cd.label in CARS_TIME_IN_QUADRILATERALS 
+            and CARS_TIME_IN_QUADRILATERALS[cd.label] >= TIME_IN_QUADRILATERAL_FOR_STOP
+        ):
+            return ANN_COLORS.GREEN.value
+        return ANN_COLORS.RED.value
+    return ANN_COLORS.WHITE.value
 
 
-def detect_and_track_cars(frame: np.ndarray) -> np.ndarray:
-    detections = get_car_detections(frame)
-    return draw_car_detections(frame, detections)
+def parse_car_annotations_from_detections(car_detections: list[CarDetection]) -> list[CarAnnotation]:
+    annotations = []
+    for car_detection in car_detections:
+        annotation = CarAnnotation.from_car_detection(car_detection)
+        annotations.append(annotation)
+    return annotations
 
+def parse_car_detections(detections: Detections) -> list[CarDetection]:
+    car_detections = []
+    for i in range(len(detections)):
+        detection = CarDetection.from_detections(detections, i)
+        if detection:
+            car_detections.append(detection)
+    return car_detections
+
+def draw_car_annotations(
+    frame: np.ndarray,
+    car_annotations: list[CarAnnotation],
+) -> np.ndarray:
+    """
+    Updates the frame with given car annotations.
+    """
+    annotated_frame = frame.copy()
+
+    CarAnnotation.draw_annotations(annotated_frame, car_annotations)
+
+    return annotated_frame
+
+# time in seconds a car must be in a quadrilateral to be considered stopped
+TIME_IN_QUADRILATERAL_FOR_STOP = 1
+
+# def log_cars_stopped_in_quadrilaterals():
+#     for car_label, quadrilateral_times in CARS_TIME_IN_QUADRILATERALS.items():
+#         for i, time in quadrilateral_times.items():
+#             if time >= TIME_IN_QUADRILATERAL_FOR_STOP:
+#                 print(f"Car {car_label} stopped in quadrilateral {i} for {time:.2f} seconds.")
 
 def main(video_path):
     cap = cv2.VideoCapture(video_path)
@@ -235,10 +262,13 @@ def main(video_path):
             if not ret:
                 print("End of video.")
                 break
-
-            frame = detect_and_track_cars(frame)
-            draw_quadrilaterals(frame)
-        cv2.imshow("Car Detection", frame)
+            sv_detections = get_car_detections(frame)
+            car_detections = parse_car_detections(sv_detections)
+            update_car_time_in_quadrilaterals(car_detections)
+            car_annotations = parse_car_annotations_from_detections(car_detections)
+            annotated_frame = draw_car_annotations(frame, car_annotations)
+            draw_quadrilaterals(annotated_frame)
+        cv2.imshow("Car Detection", annotated_frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
