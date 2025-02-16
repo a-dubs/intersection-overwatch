@@ -1,4 +1,5 @@
 import dataclasses
+import datetime
 import enum
 from pprint import pprint
 from typing import Optional
@@ -7,9 +8,11 @@ import json
 import os
 import numpy as np
 from ultralytics import YOLO
+from supervision.detection.core import Detections
+import supervision as sv
 
 # Constants
-BOX_COLOR = (0, 0, 255)  # Red color in BGR
+BOX_COLOR = (128, 128, 255)  # Bluer grey color in BGR
 HIGHLIGHT_COLOR = (0, 255, 0)  # Green color for selected points
 HIT_BOX_COLOR = (255, 255, 255)  # White color for detected objects
 INTERSECT_COLOR = (0, 0, 255)  # Red color for intersections
@@ -22,80 +25,10 @@ FPS = None
 
 # map car id to a dict containg a key for each quadrilateral and the time spent in that quadrilateral
 CARS_TIME_IN_QUADRILATERALS = {}
-CARS_IN_QUADRILATERALS = {}  # map label to detection
 
 # Load YOLO model
 model = YOLO("yolov8n.pt")
 
-# Load existing quadrilaterals or create a new structure
-if os.path.exists(JSON_FILE):
-    with open(JSON_FILE, "r") as f:
-        quadrilaterals = json.load(f).get("quadrilaterals", [])
-else:
-    quadrilaterals = []
-
-def draw_quadrilaterals(frame):
-    """Draw the quadrilaterals on the frame."""
-    overlay = frame.copy()
-    for quad in quadrilaterals:
-        pts = np.array(quad, dtype=np.int32)
-        cv2.fillPoly(overlay, [pts], BOX_COLOR)
-    cv2.addWeighted(overlay, BOX_OPACITY, frame, 1 - BOX_OPACITY, 0, frame)
-    for quad in quadrilaterals:
-        pts = np.array(quad, dtype=np.int32)
-        cv2.polylines(frame, [pts], isClosed=True, color=BOX_COLOR, thickness=2)
-        for point in quad:
-            cv2.circle(frame, (point[0], point[1]), POINT_RADIUS, (255, 255, 255), -1)
-
-from ultralytics import YOLO
-from supervision.detection.core import Detections
-import supervision as sv
-
-
-# Initialize tracker
-tracker = sv.ByteTrack()
-
-# Annotators
-box_annotator = sv.BoxAnnotator()
-label_annotator = sv.LabelAnnotator()
-
-def format_label(class_name: str, tracker_id: int) -> str:
-    return f"{class_name} #{tracker_id}".capitalize()
-
-def get_car_detections(frame: np.ndarray) -> Detections:
-    results = model(frame)[0]
-    detections = sv.Detections.from_ultralytics(results)
-    detections: Detections = tracker.update_with_detections(detections)
-    return detections
-
-# def get_cars_in_quadrilaterals(detections: Detections) -> list:
-#     cars = []
-#     for i in range(len(detections)):
-#         detection = detections[i]
-#         x1, y1, x2, y2 = map(int, detection[0].xyxy[0])
-#         car_center = ((x1 + x2) // 2, (y1 + y2) // 2)
-#         for quad in quadrilaterals:
-#             if cv2.pointPolygonTest(np.array(quad, dtype=np.int32), car_center, False) >= 0:
-#                 cars.append(detection)
-#                 break
-#     print("Cars in quadrilaterals:", cars)
-#     return cars
-
-def get_car_label(detection: Detections) -> str:
-    class_name = detection[-1]["class_name"][0]
-    tracker_id = detection.tracker_id[0]
-    return format_label(class_name, tracker_id)
-
-def remove_detection(detections: Detections, index: int) -> Detections:
-    return Detections(
-        xyxy=np.delete(detections.xyxy, index, axis=0),
-        confidence=np.delete(detections.confidence, index, axis=0),
-        class_id=np.delete(detections.class_id, index, axis=0),
-        tracker_id=np.delete(detections.tracker_id, index, axis=0),
-        mask=detections.mask,
-        data={key: np.delete(value, index, axis=0) for key, value in detections.data.items()},
-        metadata={key: value for key, value in detections.metadata.items()}
-    )
 
 
 @enum.unique
@@ -133,19 +66,20 @@ class CarDetection:
         return format_label(self.class_name, self.tracker_id)
     
     @property
-    def is_in_quadrilateral(self):
+    def is_in_quadrilateral(self) -> Optional[str]:
         x1, y1, x2, y2 = map(int, self.xyxy)
         car_center = ((x1 + x2) // 2, (y1 + y2) // 2)
         for quad in quadrilaterals:
-            if cv2.pointPolygonTest(np.array(quad, dtype=np.int32), car_center, False) >= 0:
-                return True
-        return False
+            if cv2.pointPolygonTest(np.array(quad.bounding_box, dtype=np.int32), car_center, False) >= 0:
+                return quad.name
+        return None
     
 @dataclasses.dataclass
 class CarAnnotation:
     xyxy: tuple
     color: tuple = ANN_COLORS.WHITE.value
     label: Optional[str] = None
+    fill_color: Optional[tuple] = None
 
     # function that takes in a frame and draws the object annotation on the frame
     def draw(self, frame):
@@ -161,6 +95,12 @@ class CarAnnotation:
                 color=self.color,
                 thickness=2
             )
+        if self.fill_color:
+            fill_opacity = 0.4
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), self.fill_color, -1)
+            cv2.addWeighted(overlay, fill_opacity, frame, 1 - fill_opacity, 0, frame)
+
 
     @classmethod
     def draw_annotations(
@@ -173,28 +113,177 @@ class CarAnnotation:
 
     @classmethod
     def from_car_detection(cls, detection: CarDetection):
+        fill_color = None
+        if (
+            detection.label in CAR_DATA_DB
+            and CAR_DATA_DB[detection.label].entered_through_quad
+            and CAR_DATA_DB[detection.label].time_in_entered_quad >= TIME_IN_QUADRILATERAL_FOR_STOP
+        ):
+            fill_color = ANN_COLORS.GREEN.value
         return cls(
             xyxy=detection.xyxy,
             color=get_car_annotation_color(detection),
-            label=detection.label
+            label=detection.label,
+            fill_color=fill_color,
         )
+
+
+@dataclasses.dataclass
+class CarData:
+    label: str
+    time_in_entered_quad: Optional[float] = None
+    timestamp_first_seen: Optional[str] = None  # iso format tz aware string
+    timestamp_last_seen: Optional[str] = None  # iso format tz aware string
+    entered_through_quad: Optional[str] = None  # the first quadrilateral the car entered through
+    exited_through_quad: Optional[str] = None  # the last quadrilateral the car exited through before leaving the frame 
+
+    @classmethod
+    def from_car_detection(cls, detection: CarDetection):
+        current_quad = detection.is_in_quadrilateral
+        if not current_quad:
+            time_in_quad = None
+        else:
+            time_in_quad = CARS_TIME_IN_QUADRILATERALS[detection.label]["time"]
+        return cls(
+            label=detection.label,
+            timestamp_first_seen=timestamp_now(),
+            timestamp_last_seen=timestamp_now(),
+            entered_through_quad=detection.is_in_quadrilateral,
+            time_in_entered_quad=time_in_quad
+        )
+    
+    def update(self) -> None:
+        self.timestamp_last_seen = timestamp_now()
+        if self.label in CARS_TIME_IN_QUADRILATERALS:
+            if not self.entered_through_quad:
+                self.entered_through_quad = CARS_TIME_IN_QUADRILATERALS[self.label]["quad_name"]
+                self.time_in_entered_quad = CARS_TIME_IN_QUADRILATERALS[self.label]["time"]
+                return
+            # if the car is still in the first quadrilateral it entered through, update the time
+            if self.entered_through_quad == CARS_TIME_IN_QUADRILATERALS[self.label]["quad_name"]:
+                self.time_in_entered_quad += 1 / FPS
+            # otherwise, use the current quadrilateral as the last quadrilateral the car exited through
+            else:
+                self.exited_through_quad = CARS_TIME_IN_QUADRILATERALS[self.label]["quad_name"]
+
+
+CAR_DATA_DB: dict[str,CarData] = {}
+
+
+@dataclasses.dataclass
+class Quadrilateral:
+    name: str
+    bounding_box: list[list[int]]
+
+    @classmethod
+    def from_json(cls, quad: dict) -> "Quadrilateral":
+        name = quad["name"]
+        bounding_box = quad["bounding_box"]
+        if len(bounding_box) != 4:
+            raise ValueError("Bounding box must have 4 points.")
+        if not all(len(point) == 2 for point in bounding_box):
+            raise ValueError("Each point in the bounding box must have an x and y coordinate.")    
+        return cls(
+            name=name,
+            bounding_box=bounding_box
+        )
+    
+    @classmethod
+    def load_all_from_json(cls, quads: list[dict]) -> list["Quadrilateral"]:
+        return [cls.from_json(quad) for quad in quads]
+
+    def to_json(self):
+        return {
+            "name": self.name,
+            "bounding_box": self.bounding_box
+        }
+
+quadrilaterals: list[Quadrilateral] = []
+
+# Load existing quadrilaterals or create a new structure
+if os.path.exists(JSON_FILE):
+    with open(JSON_FILE, "r") as f:
+        quads_list = json.load(f)["quadrilaterals"]
+        quadrilaterals = Quadrilateral.load_all_from_json(quads_list)
+
+
+def draw_quadrilaterals(frame):
+    """Draw the quadrilaterals on the frame."""
+    overlay = frame.copy()
+    for quad in quadrilaterals:
+        pts = np.array(quad.bounding_box, dtype=np.int32)
+        cv2.fillPoly(overlay, [pts], BOX_COLOR)
+        # Draw the name of the quadrilateral
+        cv2.putText(
+            img=overlay,
+            text=quad.name,
+            org=(quad.bounding_box[0][0], quad.bounding_box[0][1] - 10),
+            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+            fontScale=1,
+            color=ANN_COLORS.WHITE.value,
+            thickness=2
+        )
+    # Draw the quadrilaterals on the frame
+    cv2.addWeighted(overlay, BOX_OPACITY, frame, 1 - BOX_OPACITY, 0, frame)
+    # Draw the bounding boxes and points
+    for quad in quadrilaterals:
+        pts = np.array(quad.bounding_box, dtype=np.int32)
+        cv2.polylines(frame, [pts], isClosed=True, color=BOX_COLOR, thickness=2)
+        for point in quad.bounding_box:
+            cv2.circle(frame, (point[0], point[1]), POINT_RADIUS, (255, 255, 255), -1)
+
+# Initialize tracker
+tracker = sv.ByteTrack()
+
+# Annotators
+box_annotator = sv.BoxAnnotator()
+label_annotator = sv.LabelAnnotator()
+
+def format_label(class_name: str, tracker_id: int) -> str:
+    return f"{class_name} #{tracker_id}".capitalize()
+
+def get_car_detections(frame: np.ndarray) -> Detections:
+    results = model(frame)[0]
+    detections = sv.Detections.from_ultralytics(results)
+    detections: Detections = tracker.update_with_detections(detections)
+    return detections
+
+def get_car_label(detection: Detections) -> str:
+    class_name = detection[-1]["class_name"][0]
+    tracker_id = detection.tracker_id[0]
+    return format_label(class_name, tracker_id)
 
 def update_car_time_in_quadrilaterals(car_detections: list[CarDetection]):
     global CARS_TIME_IN_QUADRILATERALS
     try:
         for car_detection in car_detections:
-            if not car_detection.is_in_quadrilateral:
+            quad_name = car_detection.is_in_quadrilateral
+            if not quad_name:
                 continue
             car_label = car_detection.label
-            if car_label not in CARS_TIME_IN_QUADRILATERALS:
-                CARS_TIME_IN_QUADRILATERALS[car_label] = 0
-            CARS_TIME_IN_QUADRILATERALS[car_label] += 1 / FPS
+            # if the car is not already in the dict or is in a different quadrilateral, add it to the dict
+            # with a time of 0
+            if (
+                car_label not in CARS_TIME_IN_QUADRILATERALS 
+                or CARS_TIME_IN_QUADRILATERALS[car_label]["quad_name"] != quad_name
+            ):
+                CARS_TIME_IN_QUADRILATERALS[car_label] = {
+                    "quad_name": quad_name,
+                    "time": 0
+                }
+            CARS_TIME_IN_QUADRILATERALS[car_label]["time"] += 1 / FPS
+        # remove any cars that are no longer actively in a quadrilateral
         car_labels = [detection.label for detection in car_detections]
         for car_label in list(CARS_TIME_IN_QUADRILATERALS.keys()):
             if car_label not in car_labels:
-                CARS_TIME_IN_QUADRILATERALS[car_label] = 0
+                CARS_TIME_IN_QUADRILATERALS[car_label]["time"] = 0
         # delete any cars with time 0
-        CARS_TIME_IN_QUADRILATERALS = {car_label: time for car_label, time in CARS_TIME_IN_QUADRILATERALS.items() if time > 0}
+        CARS_TIME_IN_QUADRILATERALS = {
+            car_label: {
+                "quad_name": quad_info["quad_name"],
+                "time": quad_info["time"],
+            } for car_label, quad_info in CARS_TIME_IN_QUADRILATERALS.items() if quad_info["time"] > 0
+        }
     except Exception as e:
         raise e
     pprint(CARS_TIME_IN_QUADRILATERALS)
@@ -203,7 +292,9 @@ def get_car_annotation_color(cd: CarDetection) -> tuple:
     if cd.is_in_quadrilateral:
         if (
             cd.label in CARS_TIME_IN_QUADRILATERALS 
-            and CARS_TIME_IN_QUADRILATERALS[cd.label] >= TIME_IN_QUADRILATERAL_FOR_STOP
+            and CARS_TIME_IN_QUADRILATERALS[cd.label]["time"] >= TIME_IN_QUADRILATERAL_FOR_STOP
+            # check DB to see if this is its entered quadrilateral
+            and CAR_DATA_DB[cd.label].entered_through_quad == cd.is_in_quadrilateral
         ):
             return ANN_COLORS.GREEN.value
         return ANN_COLORS.RED.value
@@ -247,6 +338,26 @@ TIME_IN_QUADRILATERAL_FOR_STOP = 1
 #             if time >= TIME_IN_QUADRILATERAL_FOR_STOP:
 #                 print(f"Car {car_label} stopped in quadrilateral {i} for {time:.2f} seconds.")
 
+def timestamp_now() -> str:
+    return datetime.datetime.now().isoformat()
+
+
+def update_car_data_db(car_detections: list[CarDetection]) -> None:
+    global CAR_DATA_DB
+    for car_detection in car_detections:
+        car_label = car_detection.label
+        if car_label not in CAR_DATA_DB:
+            car_data = CarData.from_car_detection(car_detection)
+            CAR_DATA_DB[car_label] = car_data
+        else:
+            car_data = CAR_DATA_DB[car_label]
+            car_data.update()
+
+def write_car_data_db_to_json() -> None:
+    car_data_list = [data.__dict__ for data in CAR_DATA_DB.values()]
+    with open("car_data_db.json", "w") as f:
+        json.dump(car_data_list, f, indent=4)
+
 def main(video_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -268,6 +379,8 @@ def main(video_path):
             car_annotations = parse_car_annotations_from_detections(car_detections)
             annotated_frame = draw_car_annotations(frame, car_annotations)
             draw_quadrilaterals(annotated_frame)
+            update_car_data_db(car_detections)
+            write_car_data_db_to_json()
         cv2.imshow("Car Detection", annotated_frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
